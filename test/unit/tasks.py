@@ -14,7 +14,7 @@ async def fail():
 
 @app.task
 async def mul(n1, n2):
-    sleep_time = 10
+    sleep_time = random()
 
     _log.debug('Multiplying %s * %s after %s secs', n1, n2, sleep_time)
 
@@ -27,10 +27,8 @@ async def mul(n1, n2):
 async def add(n1, n2):
     _log.debug('Adding %s + %s', n1, n2)
 
-    results = await asyncio.gather(
-        mul.apply_async(n1 + 1, n2 + 2),
-        fail.apply_async(),
-        mul.apply_async(n1 + 5, n2 + 6)
-    )
+    tasks = [mul.apply_async(n1 + i, n2 + i + 1) for i in range(1000)]
+
+    results = await asyncio.gather(*tasks)
 
     return sum((n1, n2, *results))
