@@ -67,12 +67,16 @@ class App:
         self._id = str(uuid.uuid4()).replace('-', '')
 
         self._tasks = {}
-        self._queues = set()
 
     async def connect(self):
         self._transport, self._protocol = await aioamqp.connect(loop=self._loop)
 
         self._channel = await self._protocol.channel()
+
+        callback_queue_name = f"{self._id}_callbacks"
+
+        await self._channel.queue_declare(queue_name=callback_queue_name, no_wait=True)
+        await self._channel.basic_consume(self._on_response, queue_name=callback_queue_name, no_wait=True)
 
     async def _on_response(self, channel: Channel, body, envelope: Envelope, properties: Properties):
 
@@ -84,7 +88,14 @@ class App:
 
             correlation = self._corr_ids[properties.correlation_id]
 
-            self._loop.call_soon_threadsafe(correlation['waiter'].set_result, json.loads(body))
+            fut: asyncio.Future = correlation['waiter']
+
+            result_payload = json.loads(body)
+
+            if result_payload['status'] == 'SUCCESS':
+                self._loop.call_soon_threadsafe(fut.set_result, result_payload['result'])
+            else:
+                self._loop.call_soon_threadsafe(fut.set_exception, Exception(result_payload['result']))
         else:
             _log.debug("It seems this wasn't for us...")
             await channel.basic_client_nack(delivery_tag=envelope.delivery_tag)
@@ -128,9 +139,21 @@ class App:
                 )
 
             def run(parent_loop: asyncio.BaseEventLoop):
-                result = call_function()
+                try:
+                    result = call_function()
 
-                asyncio.run_coroutine_threadsafe(publish_result(result), loop=parent_loop)
+                    result_payload = {
+                        'status': 'SUCCESS',
+                        'result': result
+                    }
+
+                except Exception as e:
+                    result_payload = {
+                        'status': 'FAILURE',
+                        'result': str(e)
+                    }
+
+                asyncio.run_coroutine_threadsafe(publish_result(result_payload), loop=parent_loop)
 
             Thread(target=run, args=(self._loop, )).start()
         except KeyError:
@@ -146,14 +169,6 @@ class App:
 
         queue = sig.name
 
-        callback_queue = f'{queue}_callbacks@{self._id}'
-
-        if callback_queue not in self._queues:
-            await self._channel.queue_declare(callback_queue, no_wait=True, auto_delete=True)
-            await self._channel.basic_consume(callback=self._on_response, queue_name=callback_queue, no_wait=True)
-
-            _log.debug("Created callback queue %s for task %s", callback_queue, sig.name)
-
         _log.debug(
             'Sending task %s (%s) with args=%s, kwargs=%s on queue=%s',
             sig.name, sig.sig_id, sig.args, sig.kwargs, queue
@@ -165,27 +180,34 @@ class App:
             'waiter': f
         }
 
+        callback_queue_name = f"{self._id}_callbacks"
+
         await self._channel.basic_publish(
             payload=sig.payload,
             exchange_name='',
             routing_key=sig.name,
             properties={
-                'reply_to': callback_queue,
+                'reply_to': callback_queue_name,
                 'correlation_id': sig.sig_id
             }
         )
 
         _log.debug('Waiting for task %s with id=%s...', sig.name, sig.sig_id)
 
-        result = await f
+        try:
+            result = await f
 
-        end = time.monotonic()
+            end = time.monotonic()
 
-        _log.debug('Task %s (%s) finished in %s seconds: %s', sig.name, sig.sig_id, end - start, result)
+            _log.debug('Task %s (%s) finished in %s seconds: %s', sig.name, sig.sig_id, end - start, result)
 
-        del self._corr_ids[sig.sig_id]
+            return result
+        except Exception as e:
+            _log.debug('Task %s (%s) failed: %s', sig.name, sig.sig_id, e)
 
-        return result
+            raise e
+        finally:
+            del self._corr_ids[sig.sig_id]
 
     def send(self, sig: Signature):
 
@@ -205,8 +227,6 @@ class App:
             _log.debug('Creating queue %s', queue)
 
             await self._channel.queue_declare(queue_name=queue, no_wait=True)
-
-            self._queues.add(queue)
 
             await self._channel.basic_consume(self._on_request, queue_name=queue, no_wait=True)
 

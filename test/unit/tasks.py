@@ -8,6 +8,11 @@ _log = logging.getLogger('tasks')
 
 
 @app.task
+async def fail():
+    raise Exception("oops!")
+
+
+@app.task
 async def mul(n1, n2):
     sleep_time = 10
 
@@ -24,7 +29,7 @@ async def add(n1, n2):
 
     results = await asyncio.gather(
         mul.apply_async(n1 + 1, n2 + 2),
-        mul.apply_async(n1 + 3, n2 + 4),
+        fail.apply_async(),
         mul.apply_async(n1 + 5, n2 + 6)
     )
 
